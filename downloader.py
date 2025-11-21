@@ -10,6 +10,7 @@ import binascii
 from typing import Tuple
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
+import aiofiles
 
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ def request_headers():
 # Загрузка медиафайла
 
 
-async def download_book_by_m3u8_with_aiohttp(m3u8_url, download_path):
+async def download_book_by_m3u8(m3u8_url, download_path):
 
     async def get_key(session: aiohttp.ClientSession, url: str) -> bytes:
         """Fetch decryption key from URL"""
@@ -276,7 +277,7 @@ def decode_book_info(resp_json):
 
 
 # ***********************************************************************************************************
-async def get_book(book_url):
+async def get_book_info(book_url):
 
     async with aiohttp.ClientSession() as session:
 
@@ -328,11 +329,91 @@ async def get_book(book_url):
                 book_info["hls"] = hls
                 book_info["book_id"] = book_id
                 book_info["security_ls_key"] = LIVESTREET_SECURITY_KEY
-                book_info["user_agent"] = user_agent
+                book_info["user_agent"] = user_agent()
                 book_info["cookies"] = cookies_dict
 
-                print(book_info)
-                await download_book_by_m3u8_with_aiohttp(book_info["hls"], ".")
+                return book_info
+
+
+async def download_cover(url, download_path):
+
+    filename = Path(download_path) / "cover.jpg"
+    """
+    Скачивает изображение по указанному URL и сохраняет его в файл.
+
+    Args:
+        url (str): URL изображения для скачивания.
+        filename (str): Имя файла для сохранения изображения (например, 'cover.jpg').
+    """
+    async with aiohttp.ClientSession() as session:
+        session.headers.update({"user-agent": user_agent()})
+
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()  # Выбросит исключение для статусов 4xx/5xx
+
+                # Проверяем, что это действительно изображение (опционально, но рекомендуется)
+                # if 'image' not in response.headers.get('Content-Type', '').lower():
+                #     print(f"URL {url} не указывает на изображение. Content-Type: {response.headers.get('Content-Type')}")
+                #     return
+
+                with open(filename, "wb") as f:
+                    # Читаем содержимое блоками, чтобы не загружать весь файл в память для больших изображений
+                    while True:
+                        chunk = await response.content.read(1024)  # Читаем по 1 КБ
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                logger.info(f"Изображение успешно скачано и сохранено как {filename}")
+                return True
+        except aiohttp.ClientError as e:
+            logger.error(f"Ошибка при скачивании изображения с {url}: {e}")
+        except asyncio.TimeoutError:
+            logger.error(f"Таймаут при скачивании изображения с {url}")
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка: {e}")
+        return False
+
+
+async def save_book_info(book_info: dict, download_path: str):
+
+    filename = Path(download_path) / "book_info.json"
+    """
+    Асинхронно сохраняет словарь в JSON файл.
+
+    Args:
+        data (dict): Словарь, который нужно сохранить.
+        filename (str): Имя файла (например, 'metadata.json').
+    """
+    try:
+        # Преобразуем словарь в JSON строку
+        json_string = json.dumps(book_info,  indent=4, ensure_ascii=False)
+
+        # Открываем файл асинхронно и записываем данные
+        async with aiofiles.open(filename, mode="w", encoding="utf-8") as f:
+            await f.write(json_string)
+
+        logger.info(f"Словарь успешно сохранен в {filename}")
+    except IOError as e:
+        logger.error(f"Ошибка ввода/вывода при сохранении файла {filename}: {e}")
+    except TypeError as e:
+        logger.error(
+            f"Ошибка сериализации JSON (данные не могут быть преобразованы в JSON): {e}"
+        )
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка: {e}")
+
+
+async def start(args):
+    book_info = await get_book_info(args.url)
+
+    await save_book_info(book_info, args.path)
+    if args.download_cover:
+        if not await download_cover(book_info["cover"], args.path):
+            await download_cover(book_info["cover_100"], args.path)
+
+    if args.download_media:
+        await download_book_by_m3u8(book_info["hls"], args.path)
 
 
 def parse_args(parser, logger, check_url=True):
@@ -370,18 +451,35 @@ if __name__ == "__main__":
     app_description = "Качалка akniga.org"
     parser = argparse.ArgumentParser(description=app_description)
     parser.add_argument(
-        "--verbose",
         "-v",
         help="Уровень логирования по умолчанию (если ключ не задан) - error. warning -v, info -vv, debug -vvv",
         action="count",
         default=0,
+        dest="verbose",
+    )
+
+    parser.add_argument(
+        "--media",
+        "-m",
+        help="Скачать медиафайл",
+        action="store_true",
+        dest="download_media",
     )
     parser.add_argument(
-        "--url",
+        "--cover",
+        "-c",
+        help="Скачать обложку",
+        action="store_true",
+        dest="download_cover",
+    )
+    parser.add_argument("--output", "-o", help=("Каталог для загрузки"), dest="path")
+
+    parser.add_argument(
+        "url",
         help=("url книги"),
     )
 
     args = parse_args(parser, logger)
     logger.info(args)
 
-    asyncio.run(get_book(args.url))
+    asyncio.run(start(args))
