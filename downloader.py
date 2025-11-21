@@ -14,6 +14,76 @@ from Crypto.Util.Padding import unpad
 
 logger = logging.getLogger(__name__)
 
+
+# import aiohttp
+# import asyncio
+# import m3u8
+# from pathlib import Path
+# from Crypto.Cipher import AES
+# import tqdm.asyncio
+
+
+# def request_headers():
+#     """Return request headers (same as your original)"""
+#     return {
+#         "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+#     }
+
+
+# async def download_book_by_m3u8_with_aiohttp(m3u8_url, book_folder, tmp_folder, book_json):
+#     """
+#     Downloads and decrypts HLS stream using aiohttp.
+
+#     Args:
+#         m3u8_url: URL to M3U8 playlist
+#         book_folder: Path to save the book
+#         tmp_folder: Path for temporary files
+#         book_json: Book metadata
+#     """
+
+#     async def get_key(session: aiohttp.ClientSession, url: str) -> bytes:
+#         """Fetch decryption key from URL"""
+#         async with session.get(url, headers=request_headers()) as resp:
+#             assert resp.status == 200, 'Could not fetch decryption key.'
+#             return await resp.read()
+
+#     async def make_cipher_for_segment(session: aiohttp.ClientSession, segment):
+#         """Create AES cipher for decrypting segment"""
+#         key = await get_key(session, segment.key.absolute_uri)
+#         iv = bytes.fromhex(segment.key.iv.lstrip('0x'))
+#         return AES.new(key, AES.MODE_CBC, IV=iv)
+
+#     async def download_and_decrypt_segments(session: aiohttp.ClientSession, segments, stream_path):
+#         """Download all segments and write decrypted data to file"""
+#         with open(stream_path, mode='wb') as file:
+#             # Use tqdm.asyncio for async progress bar
+#             for segment in tqdm.tqdm(segments, desc="Downloading segments"):
+#                 cipher = await make_cipher_for_segment(session, segment)
+
+#                 async with session.get(segment.absolute_uri, headers=request_headers()) as resp:
+#                     assert resp.status == 200, f'Could not download segment: {segment.absolute_uri}'
+
+#                     # Read in chunks to avoid memory overload
+#                     async for chunk in resp.content.iter_chunked(8192):
+#                         decrypted = cipher.decrypt(chunk)
+#                         file.write(decrypted)
+
+#     # Parse M3U8 playlist (m3u8 library uses requests, but we can parse locally)
+#     # If m3u8_url is remote, fetch it first
+#     async with aiohttp.ClientSession() as session:
+#         async with session.get(m3u8_url, headers=request_headers()) as resp:
+#             m3u8_content = await resp.text()
+
+#         # Parse M3U8 (synchronous operation)
+#         import io
+#         playlist = m3u8.loads(m3u8_content, uri=m3u8_url)
+#         segments = playlist.segments
+
+#         stream_path = tmp_folder / 'stream.ts'
+#         await download_and_decrypt_segments(session, segments, stream_path)
+
+#     print(f"Downloaded stream saved to: {stream_path}")
+
 # ***********************************************************************************************************
 
 # Decrypt password obtained from akniga's JS script.
@@ -182,22 +252,32 @@ def pkcs7_unpad(data: bytes) -> bytes:
 # ***********************************************************************************************************
 
 
+def decode_book_info(resp_json):
+    result = {
+        "author": resp_json["author"],
+        "title": resp_json["titleonly"],
+        "performer": resp_json["performer"],
+        "items": json.loads(resp_json["items"]),
+        "cover_100": resp_json["preview"],
+        "cover": resp_json["preview"].split("100x100crop")[0] + "400x.webp",
+    }
+
+    return result
+
+
 async def get_book(book_url):
 
     async with aiohttp.ClientSession() as session:
-        session.headers.update(
-            {
-                "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-            }
-        )
+
+        user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+        session.headers.update({"user-agent": user_agent})
+
         async with session.get(book_url) as response:
 
-            print("Status:", response.status)
-            print("Content-type:", response.headers["content-type"])
             cookies = session.cookie_jar.filter_cookies("https://akniga.org")
-            print("Cookies for akniga.org:")
+            cookies_dict = {}
             for name, morsel in cookies.items():
-                print(name, "=", morsel.value)
+                cookies_dict[name] = morsel.value
 
             html = await response.text()
             book_id = html.split("data-bid=")[1].split('"')[1]
@@ -230,12 +310,18 @@ async def get_book(book_url):
                 }
             )
             async with session.post(ajax_url, data=data_str) as response_ajax:
-                html = await response_ajax.text()
-                hres = json.loads(html)["hres"]
+                resp_text = await response_ajax.text()
+                resp_json = json.loads(resp_text)
 
-                hls = decode_url(hres)
+                hls = decode_url(resp_json["hres"])
+                book_info = decode_book_info(resp_json)
+                book_info["hls"] = hls
+                book_info["book_id"] = book_id
+                book_info["security_ls_key"] = LIVESTREET_SECURITY_KEY
+                book_info["user_agent"] = user_agent
+                book_info["cookies"] = cookies_dict
 
-                print(hls)
+                print(book_info)
 
 
 def parse_args(parser, logger, check_url=True):
@@ -288,43 +374,3 @@ if __name__ == "__main__":
     logger.info(args)
 
     asyncio.run(get_book(args.url))
-
-    # if Path(args.cookies_file).is_file():
-    #     logger.info(f"Попытка извлечь cookies из файла {args.cookies_file}")
-    #     cookies_dict = json.loads(Path(args.cookies_file).read_text())
-    #     cookies = cookiejar_from_dict(cookies_dict)
-
-    #     # Проверим, что куки из файла валидные, иначе прервем выполнение
-    #     err_msg = cookies_is_valid(cookies, args.telegram_api, args.telegram_chatid)
-    #     if not err_msg == "":
-    #         close_programm(err_msg, args.telegram_api, args.telegram_chatid)
-    # else:
-    #     err_msg = f"Не найден файл с cookies: {args.cookies_file}"
-    #     logger.error(err_msg)
-    #     close_programm(err_msg, args.telegram_api, args.telegram_chatid)
-
-    # download_book(
-    #     args.url,
-    #     args.output,
-    #     cookies,
-    #     args.telegram_api,
-    #     args.telegram_chatid,
-    #     args.progressbar,
-    #     args.cover,
-    #     args.metadata,
-    #     args.send_fb2_via_telegram,
-    # )
-
-
-# async def main():
-
-#     async with aiohttp.ClientSession() as session:
-#         async with session.get('http://python.org') as response:
-
-#             print("Status:", response.status)
-#             print("Content-type:", response.headers['content-type'])
-
-#             html = await response.text()
-#             print("Body:", html[:15], "...")
-
-# asyncio.run(main())
