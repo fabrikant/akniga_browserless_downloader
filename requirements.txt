@@ -1,2 +1,5 @@
 pycryptodome
 aiohttp
+
+m3u8
+tqdm

@@ -15,77 +15,88 @@ from Crypto.Util.Padding import unpad
 logger = logging.getLogger(__name__)
 
 
-# import aiohttp
-# import asyncio
-# import m3u8
-# from pathlib import Path
-# from Crypto.Cipher import AES
-# import tqdm.asyncio
+import m3u8
+from pathlib import Path
+import tqdm.asyncio
 
 
-# def request_headers():
-#     """Return request headers (same as your original)"""
-#     return {
-#         "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-#     }
+def user_agent():
+    return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
 
 
-# async def download_book_by_m3u8_with_aiohttp(m3u8_url, book_folder, tmp_folder, book_json):
-#     """
-#     Downloads and decrypts HLS stream using aiohttp.
-
-#     Args:
-#         m3u8_url: URL to M3U8 playlist
-#         book_folder: Path to save the book
-#         tmp_folder: Path for temporary files
-#         book_json: Book metadata
-#     """
-
-#     async def get_key(session: aiohttp.ClientSession, url: str) -> bytes:
-#         """Fetch decryption key from URL"""
-#         async with session.get(url, headers=request_headers()) as resp:
-#             assert resp.status == 200, 'Could not fetch decryption key.'
-#             return await resp.read()
-
-#     async def make_cipher_for_segment(session: aiohttp.ClientSession, segment):
-#         """Create AES cipher for decrypting segment"""
-#         key = await get_key(session, segment.key.absolute_uri)
-#         iv = bytes.fromhex(segment.key.iv.lstrip('0x'))
-#         return AES.new(key, AES.MODE_CBC, IV=iv)
-
-#     async def download_and_decrypt_segments(session: aiohttp.ClientSession, segments, stream_path):
-#         """Download all segments and write decrypted data to file"""
-#         with open(stream_path, mode='wb') as file:
-#             # Use tqdm.asyncio for async progress bar
-#             for segment in tqdm.tqdm(segments, desc="Downloading segments"):
-#                 cipher = await make_cipher_for_segment(session, segment)
-
-#                 async with session.get(segment.absolute_uri, headers=request_headers()) as resp:
-#                     assert resp.status == 200, f'Could not download segment: {segment.absolute_uri}'
-
-#                     # Read in chunks to avoid memory overload
-#                     async for chunk in resp.content.iter_chunked(8192):
-#                         decrypted = cipher.decrypt(chunk)
-#                         file.write(decrypted)
-
-#     # Parse M3U8 playlist (m3u8 library uses requests, but we can parse locally)
-#     # If m3u8_url is remote, fetch it first
-#     async with aiohttp.ClientSession() as session:
-#         async with session.get(m3u8_url, headers=request_headers()) as resp:
-#             m3u8_content = await resp.text()
-
-#         # Parse M3U8 (synchronous operation)
-#         import io
-#         playlist = m3u8.loads(m3u8_content, uri=m3u8_url)
-#         segments = playlist.segments
-
-#         stream_path = tmp_folder / 'stream.ts'
-#         await download_and_decrypt_segments(session, segments, stream_path)
-
-#     print(f"Downloaded stream saved to: {stream_path}")
+def request_headers():
+    """Return request headers (same as your original)"""
+    return {"user-agent": user_agent()}
 
 
 # ***********************************************************************************************************
+# Загрузка медиафайла
+
+
+async def download_book_by_m3u8_with_aiohttp(m3u8_url, download_path):
+
+    async def get_key(session: aiohttp.ClientSession, url: str) -> bytes:
+        """Fetch decryption key from URL"""
+        async with session.get(url, headers=request_headers()) as resp:
+            assert resp.status == 200, "Could not fetch decryption key."
+            return await resp.read()
+
+    async def make_cipher_for_segment(session: aiohttp.ClientSession, segment):
+        """Create AES cipher for decrypting segment"""
+        key = await get_key(session, segment.key.absolute_uri)
+        iv = bytes.fromhex(segment.key.iv.lstrip("0x"))
+        return AES.new(key, AES.MODE_CBC, IV=iv)
+
+    async def download_and_decrypt_segments(
+        session: aiohttp.ClientSession, segments, stream_path
+    ):
+        """Download all segments and write decrypted data to file"""
+        with open(stream_path, mode="wb") as file:
+            for segment in tqdm.asyncio.tqdm(segments, desc="Downloading segments"):
+                cipher = await make_cipher_for_segment(session, segment)
+
+                async with session.get(
+                    segment.absolute_uri, headers=request_headers()
+                ) as resp:
+                    assert (
+                        resp.status == 200
+                    ), f"Could not download segment: {segment.absolute_uri}"
+
+                    buffer = b""
+                    async for chunk in resp.content.iter_chunked(8192):
+                        buffer += chunk
+                        # Process complete 16-byte blocks
+                        while len(buffer) >= 16:
+                            block = buffer[:16]
+                            buffer = buffer[16:]
+                            decrypted = cipher.decrypt(block)
+                            file.write(decrypted)
+
+                    # Last block (should be padded by server)
+                    if buffer:
+                        decrypted = cipher.decrypt(buffer)
+                        file.write(decrypted)
+
+    # Parse M3U8 playlist (m3u8 library uses requests, but we can parse locally)
+    # If m3u8_url is remote, fetch it first
+    async with aiohttp.ClientSession() as session:
+        async with session.get(m3u8_url, headers=request_headers()) as resp:
+            m3u8_content = await resp.text()
+
+        # Parse M3U8 (synchronous operation)
+        import io
+
+        playlist = m3u8.loads(m3u8_content, uri=m3u8_url)
+        segments = playlist.segments
+
+        stream_path = Path(download_path) / "stream.ts"
+        await download_and_decrypt_segments(session, segments, stream_path)
+
+    print(f"Downloaded stream saved to: {stream_path}")
+
+
+# ***********************************************************************************************************
+# Расшифровка URL адреса HLS
 
 # Decrypt password obtained from akniga's JS script.
 # Found all string parts and tried to brute force the password.
@@ -251,8 +262,6 @@ def pkcs7_unpad(data: bytes) -> bytes:
 
 
 # ***********************************************************************************************************
-
-
 def decode_book_info(resp_json):
     result = {
         "author": resp_json["author"],
@@ -266,12 +275,12 @@ def decode_book_info(resp_json):
     return result
 
 
+# ***********************************************************************************************************
 async def get_book(book_url):
 
     async with aiohttp.ClientSession() as session:
 
-        user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-        session.headers.update({"user-agent": user_agent})
+        session.headers.update({"user-agent": user_agent()})
 
         async with session.get(book_url) as response:
 
@@ -323,6 +332,7 @@ async def get_book(book_url):
                 book_info["cookies"] = cookies_dict
 
                 print(book_info)
+                await download_book_by_m3u8_with_aiohttp(book_info["hls"], ".")
 
 
 def parse_args(parser, logger, check_url=True):
