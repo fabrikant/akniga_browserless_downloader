@@ -7,7 +7,6 @@ from urllib.parse import urlencode
 import hashlib
 import base64
 import binascii
-from typing import Tuple
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 import aiofiles
@@ -93,7 +92,7 @@ async def download_book_by_m3u8(m3u8_url, download_path):
         stream_path = Path(download_path) / "stream.ts"
         await download_and_decrypt_segments(session, segments, stream_path)
 
-    print(f"Downloaded stream saved to: {stream_path}")
+    logger.info(f"Медиафайл успешно скачан и сохранен как: {stream_path}")
 
 
 # ***********************************************************************************************************
@@ -277,55 +276,108 @@ def decode_book_info(resp_json):
 
 
 # ***********************************************************************************************************
+
+
 async def get_book_info(book_url):
+    """
+    Асинхронно получает информацию о книге с akniga.org.
 
-    async with aiohttp.ClientSession() as session:
+    Args:
+        book_url (str): URL страницы книги на akniga.org.
 
-        session.headers.update({"user-agent": user_agent()})
+    Returns:
+        dict: Словарь с информацией о книге, или None в случае ошибки.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            session.headers.update({"user-agent": user_agent()})
 
-        async with session.get(book_url) as response:
+            # --- Шаг 1: GET-запрос к странице книги ---
+            try:
+                async with session.get(book_url, timeout=15) as response:
+                    response.raise_for_status()  # Выбросит исключение для статусов 4xx/5xx
+                    html = await response.text()
+            except aiohttp.ClientError as e:
+                logger.error(f"Ошибка HTTP при GET-запросе к {book_url}: {e}")
+                return None
+            except asyncio.TimeoutError:
+                logger.error(f"Таймаут при GET-запросе к {book_url}")
+                return None
+            except Exception as e:
+                logger.error(f"Неизвестная ошибка при GET-запросе к {book_url}: {e}")
+                return None
 
-            cookies = session.cookie_jar.filter_cookies("https://akniga.org")
-            cookies_dict = {}
-            for name, morsel in cookies.items():
-                cookies_dict[name] = morsel.value
+            # --- Шаг 2: Парсинг HTML для извлечения book_id и LIVESTREET_SECURITY_KEY ---
+            try:
+                # Извлечение cookie, если это необходимо для последующих запросов
+                cookies = session.cookie_jar.filter_cookies("https://akniga.org")
+                cookies_dict = {name: morsel.value for name, morsel in cookies.items()}
 
-            html = await response.text()
-            book_id = html.split("data-bid=")[1].split('"')[1]
-            LIVESTREET_SECURITY_KEY = (
-                html.split("LIVESTREET_SECURITY_KEY")[1]
-                .split("=")[1]
-                .split(",")[0]
-                .strip()
-                .split("'")[1]
-            )
+                book_id = html.split("data-bid=")[1].split('"')[1]
+                LIVESTREET_SECURITY_KEY = (
+                    html.split("LIVESTREET_SECURITY_KEY")[1]
+                    .split("=")[1]
+                    .split(",")[0]
+                    .strip()
+                    .split("'")[1]
+                )
+            except IndexError as e:
+                logger.error(
+                    f"Ошибка парсинга HTML (не найден book_id или LIVESTREET_SECURITY_KEY) на {book_url}: {e}"
+                )
+                return None
+            except Exception as e:
+                logger.error(f"Неизвестная ошибка при парсинге HTML на {book_url}: {e}")
+                return None
 
-            ajax_url = f"https://akniga.org/ajax/b/{book_id}"
-            data = {
-                "bid": book_id,
-                "hls": "true",
-                "security_ls_key": LIVESTREET_SECURITY_KEY,
-            }
-            data_str = urlencode(data)
-            session.headers.update(
-                {
-                    "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
-                    "Connection": "keep-alive",
-                    "Pragma": "no-cache",
-                    "Cache-Control": "no-cache",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Origin": "https://akniga.org",
-                    "Referer": book_url,
+            # --- Шаг 3: POST-запрос к AJAX API ---
+            try:
+                ajax_url = f"https://akniga.org/ajax/b/{book_id}"
+                data = {
+                    "bid": book_id,
+                    "hls": "true",
+                    "security_ls_key": LIVESTREET_SECURITY_KEY,
                 }
-            )
-            async with session.post(ajax_url, data=data_str) as response_ajax:
-                resp_text = await response_ajax.text()
+                data_str = urlencode(data)
+
+                # Обновляем заголовки для POST-запроса
+                session.headers.update(
+                    {
+                        "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+                        "Connection": "keep-alive",
+                        "Pragma": "no-cache",
+                        "Cache-Control": "no-cache",
+                        "Accept": "application/json, text/javascript, */*; q=0.01",
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Origin": "https://akniga.org",
+                        "Referer": book_url,
+                    }
+                )
+
+                async with session.post(
+                    ajax_url, data=data_str, timeout=15
+                ) as response_ajax:
+                    response_ajax.raise_for_status()  # Выбросит исключение для статусов 4xx/5xx
+                    resp_text = await response_ajax.text()
+            except aiohttp.ClientError as e:
+                logger.error(f"Ошибка HTTP при POST-запросе к {ajax_url}: {e}")
+                return None
+            except asyncio.TimeoutError:
+                logger.error(f"Таймаут при POST-запросе к {ajax_url}")
+                return None
+            except Exception as e:
+                logger.error(f"Неизвестная ошибка при POST-запросе к {ajax_url}: {e}")
+                return None
+
+            # --- Шаг 4: Парсинг JSON-ответа и декодирование информации ---
+            try:
                 resp_json = json.loads(resp_text)
 
                 hls = decode_url(resp_json["hres"])
+                # Убедитесь, что decode_book_info корректно обрабатывает возможные отсутствующие ключи
                 book_info = decode_book_info(resp_json)
+
                 book_info["hls"] = hls
                 book_info["book_id"] = book_id
                 book_info["security_ls_key"] = LIVESTREET_SECURITY_KEY
@@ -333,6 +385,28 @@ async def get_book_info(book_url):
                 book_info["cookies"] = cookies_dict
 
                 return book_info
+            except json.JSONDecodeError as e:
+                logger.error(
+                    f"Ошибка декодирования JSON-ответа от {ajax_url}: {e}. Ответ: {resp_text[:200]}..."
+                )  # Показать часть ответа
+                return None
+            except KeyError as e:
+                logger.error(
+                    f"Ошибка: отсутствующий ключ в JSON-ответе от {ajax_url}: {e}. Ответ: {resp_json}"
+                )
+                return None
+            except Exception as e:
+                logger.error(
+                    f"Неизвестная ошибка при обработке JSON-ответа или декодировании: {e}"
+                )
+                return None
+
+    # Общий блок исключений для любых ошибок, которые могли не быть перехвачены выше
+    except Exception as e:
+        logger.error(
+            f"Произошла непредвиденная ошибка в get_book_info для {book_url}: {e}"
+        )
+        return None
 
 
 async def download_cover(url, download_path):
@@ -353,9 +427,11 @@ async def download_cover(url, download_path):
                 response.raise_for_status()  # Выбросит исключение для статусов 4xx/5xx
 
                 # Проверяем, что это действительно изображение (опционально, но рекомендуется)
-                # if 'image' not in response.headers.get('Content-Type', '').lower():
-                #     print(f"URL {url} не указывает на изображение. Content-Type: {response.headers.get('Content-Type')}")
-                #     return
+                if "image" not in response.headers.get("Content-Type", "").lower():
+                    logger.error(
+                        f"URL {url} не указывает на изображение. Content-Type: {response.headers.get('Content-Type')}"
+                    )
+                    return False
 
                 with open(filename, "wb") as f:
                     # Читаем содержимое блоками, чтобы не загружать весь файл в память для больших изображений
@@ -366,6 +442,7 @@ async def download_cover(url, download_path):
                         f.write(chunk)
                 logger.info(f"Изображение успешно скачано и сохранено как {filename}")
                 return True
+
         except aiohttp.ClientError as e:
             logger.error(f"Ошибка при скачивании изображения с {url}: {e}")
         except asyncio.TimeoutError:
@@ -387,13 +464,13 @@ async def save_book_info(book_info: dict, download_path: str):
     """
     try:
         # Преобразуем словарь в JSON строку
-        json_string = json.dumps(book_info,  indent=4, ensure_ascii=False)
+        json_string = json.dumps(book_info, indent=4, ensure_ascii=False)
 
         # Открываем файл асинхронно и записываем данные
         async with aiofiles.open(filename, mode="w", encoding="utf-8") as f:
             await f.write(json_string)
 
-        logger.info(f"Словарь успешно сохранен в {filename}")
+        logger.info(f"Информация о книге успешно скачана и сохранена как {filename}")
     except IOError as e:
         logger.error(f"Ошибка ввода/вывода при сохранении файла {filename}: {e}")
     except TypeError as e:
